@@ -124,10 +124,17 @@ def main():
 		'-p', '--persist', action='store', type=str,
 		default='/tmp/vspheretasks.lock',
 		help='Persistence record for reported tasks.' )
+	parser.add_argument(
+		'-v', '--verbose', action='store_true',
+		help='Debug output.' )
 
 	args = parser.parse_args()
 
-	logging.basicConfig( level=logging.INFO )
+	if args.verbose:
+		loglevel = logging.DEBUG
+	else:
+		loglevel = logging.INFO
+	logging.basicConfig( level=loglevel )
 	logger = logging.getLogger( 'main' )
 
 	config = ConfigParser()
@@ -137,28 +144,25 @@ def main():
 	hostname = config.get( 'auth', 'hostname' )
 
 	filter_spec = request_filter( hours=args.hours, no_verify=args.noverify )
-	events = request_tasks(
+	tasks = request_tasks(
 		filter_spec, username, password, hostname, args.persist )
-	events.sort( key=lambda x: calendar.timegm( x.startTime.timetuple() ) )
+	tasks.sort( key=lambda x: calendar.timegm( x.startTime.timetuple() ) )
 
 	# Grab the current persist state if any.
-	last_closed_task_id=0
-	last_closed_task_epoch=0
+	last_pass_epoch=0
+	last_pass_epoch_tasks=[]
 	running_tasks=[]
-	epoch_cleanup=[]
 	persist = ConfigParser()
-	epochs = []
 	if os.path.exists( args.persist ):
 		persist.read( args.persist )
-		username = config.get( 'auth', 'username' )
+		last_pass_epoch = persist.get( 'tasks', 'current' )
+		last_pass_epoch_tasks = \
+			persist.get( 'tasks', 'current_tasks' ).split( ',' )
 		running_tasks = persist.get( 'tasks', 'running' ).split( ',' )
-		epochs = persist.options( 'epochs' )
-		epochs.sort()
 	else:
 		persist.add_section( 'tasks' )
-		persist.add_section( 'epochs' )
 
-	for e in events:
+	for e in tasks:
 
 		task_id = e.key.split( '-' )[1]
 		task_epoch = calendar.timegm( e.startTime.timetuple() )
@@ -171,22 +175,35 @@ def main():
 			running_tasks.remove( task_id )
 		elif task_id not in running_tasks and 'running' == e.state:
 			# This must be a new running task.
-			running_tasks.add( task_id )
+			running_tasks.append( task_id )
 		
-		if task_epoch in epochs:
-			task_epoch_task_ids = persist.get( 'epochs', task_epoch ).split( ',' )
-			if task_id in task_epoch_task_ids:
+		if int( task_epoch ) < int( last_pass_epoch ):
+			# Ancient history.
+			logger.debug( 'Old task {} in epoch: {} (LPE: {})'.format(
+				task_id, task_epoch, last_pass_epoch ) )
+			continue
+		elif int( task_epoch ) == int( last_pass_epoch ):
+			if task_id in last_pass_epoch_tasks:
 				# This task was already closed and reported.
+				logger.debug( 'Skipping task {} in epoch: {}'.format(
+					task_id, task_epoch ) )
 				continue
 			else:
 				# A new task for this epoch.
-				task_epoch_task_ids.add( task_id )
-				persist.set( 'epochs', task_epoch, ','.join( task_epoch_task_ids )  )
+				logger.debug( 'Adding task {} to epoch: {}'.format(
+					task_id, task_epoch ) )
+				last_pass_epoch_tasks.append( task_id )
+				persist.set( 'tasks', 'current_tasks', 
+					','.join( last_pass_epoch_tasks )  )
 		else:
 			# Task with a new epoch, so the previous is probably closed.
-			task_epoch_task_ids = []
-			epochs.append( task_epoch )
-			persist.set( 'epochs', task_epoch, ','.join( task_epoch_task_ids )  )
+			logger.debug( 'Opening new epoch: {}'.format( task_epoch ) )
+			last_pass_epoch = task_epoch
+			last_pass_epoch_tasks = []
+			last_pass_epoch_tasks.append( task_id )
+			persist.set( 'tasks', 'current', last_pass_epoch )
+			persist.set( 'tasks', 'current_tasks',
+				','.join( last_pass_epoch_tasks )  )
 
 		# Output the current task.
 		if 'json' == args.output:
@@ -204,9 +221,6 @@ def main():
 				reason ) )
 
 	persist.set( 'tasks', 'running', ','.join( running_tasks ) )
-	for epoch in epochs:
-		if epoch in epoch_cleanup:
-			persist.remove_option( 'epochs', epoch )
 	with open( args.persist, 'w' ) as persist_file:
 		persist.write( persist_file )
 

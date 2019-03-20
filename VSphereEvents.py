@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta
 from pyVim.connect import SmartConnect
 from pyVmomi import vim, vmodl
-from ConfigParser import ConfigParser
+from ConfigParser import RawConfigParser as ConfigParser
 import requests
 import ssl
 import logging
@@ -139,21 +139,24 @@ def main():
 	filter_spec = request_filter( hours=args.hours, no_verify=args.noverify )
 	events = request_tasks(
 		filter_spec, username, password, hostname, args.persist )
-	events.sort( key=lambda x: x.key.split( '-' )[1] )
+	events.sort( key=lambda x: calendar.timegm( x.startTime.timetuple() ) )
 
 	# Grab the current persist state if any.
 	last_closed_task_id=0
 	last_closed_task_epoch=0
 	running_tasks=[]
+	epoch_cleanup=[]
 	persist = ConfigParser()
+	epochs = []
 	if os.path.exists( args.persist ):
 		persist.read( args.persist )
 		username = config.get( 'auth', 'username' )
 		running_tasks = persist.get( 'tasks', 'running' ).split( ',' )
-		last_closed_task_epoch = persist.get( 'tasks', 'last_epoch' )
-		last_closed_task_id = persist.get( 'tasks', 'last_id' )
+		epochs = persist.options( 'epochs' )
+		epochs.sort()
 	else:
 		persist.add_section( 'tasks' )
+		persist.add_section( 'epochs' )
 
 	for e in events:
 
@@ -170,11 +173,20 @@ def main():
 			# This must be a new running task.
 			running_tasks.add( task_id )
 		
-		if task_epoch < last_closed_task_epoch or task_id == last_closed_task_id:
-			# This task was already closed and reported.
-			continue
-		elif task_epoch > last_closed_task_epoch:
-			last_closed_task = task_sort_key
+		if task_epoch in epochs:
+			task_epoch_task_ids = persist.get( 'epochs', task_epoch ).split( ',' )
+			if task_id in task_epoch_task_ids:
+				# This task was already closed and reported.
+				continue
+			else:
+				# A new task for this epoch.
+				task_epoch_task_ids.add( task_id )
+				persist.set( 'epochs', task_epoch, ','.join( task_epoch_task_ids )  )
+		else:
+			# Task with a new epoch, so the previous is probably closed.
+			task_epoch_task_ids = []
+			epochs.append( task_epoch )
+			persist.set( 'epochs', task_epoch, ','.join( task_epoch_task_ids )  )
 
 		# Output the current task.
 		if 'json' == args.output:
@@ -192,7 +204,9 @@ def main():
 				reason ) )
 
 	persist.set( 'tasks', 'running', ','.join( running_tasks ) )
-	persist.set( 'tasks', 'last', last_closed_task )
+	for epoch in epochs:
+		if epoch in epoch_cleanup:
+			persist.remove_option( 'epochs', epoch )
 	with open( args.persist, 'w' ) as persist_file:
 		persist.write( persist_file )
 

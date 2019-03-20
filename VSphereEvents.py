@@ -2,14 +2,20 @@
 
 from datetime import datetime, timedelta
 from pyVim.connect import SmartConnect
-from pyVmomi import vim
+from pyVmomi import vim, vmodl
 from ConfigParser import ConfigParser
 import requests
 import ssl
 import logging
 import argparse
+import jsonpickle
+import os
+import calendar
 
-def request_filter( hours=24, no_verify=True ):
+FILTER_TASKS=1
+FILTER_EVENTS=2
+
+def request_filter( hours=24, no_verify=True, f_type=FILTER_TASKS ):
 
 	logger = logging.getLogger( 'request.filter' )
 
@@ -22,11 +28,18 @@ def request_filter( hours=24, no_verify=True ):
 		context.verify_mode = ssl.CERT_NONE
 
 	# Build the filter spec.
-	time_filter = vim.event.EventFilterSpec.ByTime()
+	if FILTER_TASKS == f_type:
+		time_filter = vim.TaskFilterSpec.ByTime()
+	elif FILTER_EVENTS == f_type:
+		time_filter = vim.event.EventFilterSpec.ByTime()
 	now = datetime.now()
+	time_filter.timeType = vim.TaskFilterSpec.TimeOption.startedTime
 	time_filter.beginTime = now - timedelta( hours=hours )
 	time_filter.endTime = now
-	filter_spec = vim.event.EventFilterSpec( time=time_filter )
+	if FILTER_TASKS == f_type:
+		filter_spec = vim.TaskFilterSpec( time=time_filter )
+	elif FILTER_EVENTS == f_type:
+		filter_spec = vim.event.EventFilterSpec( time=time_filter )
 
 	return filter_spec
 
@@ -35,8 +48,12 @@ def request_events( filter_spec, username, password ):
 	logger = logging.getLogger( 'request.events' )
 
 	# Connect to the VCSA.
-	si = SmartConnect(
-		host='172.30.1.29', user=username, pwd=password )
+	try:
+		si = SmartConnect(
+			host=hostname, user=username, pwd=password )
+	except ssl.SSLError as e:
+		logger.error( e )
+		return []
 
 	# Setup pager/filter.
 	event_manager = si.content.eventManager
@@ -56,6 +73,36 @@ def request_events( filter_spec, username, password ):
 
 	return events
 
+def request_tasks( filter_spec, username, password, hostname, persist ):
+
+	logger = logging.getLogger( 'request.tasks' )
+
+	# Connect to the VCSA.
+	try:
+		si = SmartConnect(
+			host=hostname, user=username, pwd=password )
+	except ssl.SSLError as e:
+		logger.error( e )
+		return []
+
+	# Setup pager/filter.
+	task_manager = si.content.taskManager
+	task_collector = task_manager.CreateCollectorForTasks( filter_spec )
+	page_size = 1000
+	tasks = []
+
+	while True:
+		try:
+			tasks_in_page = task_collector.ReadNextTasks( page_size )
+			tasks_in_page_len = len( tasks_in_page )
+			if 0 == tasks_in_page_len:
+				break
+			tasks.extend( tasks_in_page )
+		except Exception as e:
+			logger.error( e )
+
+	return tasks
+
 def main():
 
 	parser = argparse.ArgumentParser()
@@ -67,6 +114,16 @@ def main():
 		'-c', '--config', action='store', type=str,
 		default='Local/vsphere.ini',
 		help='Path to config file.' )
+	parser.add_argument(
+		'-o', '--output', action='store', type=str, default='log',
+		help='Output format (log|syslog|json)' )
+	parser.add_argument(
+		'-n', '--noverify', action='store_true',
+		help='Do not verify SSL certificates.' )
+	parser.add_argument(
+		'-p', '--persist', action='store', type=str,
+		default='/tmp/vspheretasks.lock',
+		help='Persistence record for reported tasks.' )
 
 	args = parser.parse_args()
 
@@ -77,12 +134,67 @@ def main():
 	config.read( args.config )
 	username = config.get( 'auth', 'username' )
 	password = config.get( 'auth', 'password' )
+	hostname = config.get( 'auth', 'hostname' )
 
-	filter_spec = request_filter( hours=args.hours )
-	events = request_events( filter_spec, username, password )
+	filter_spec = request_filter( hours=args.hours, no_verify=args.noverify )
+	events = request_tasks(
+		filter_spec, username, password, hostname, args.persist )
+	events.sort( key=lambda x: x.key.split( '-' )[1] )
+
+	# Grab the current persist state if any.
+	last_closed_task_id=0
+	last_closed_task_epoch=0
+	running_tasks=[]
+	persist = ConfigParser()
+	if os.path.exists( args.persist ):
+		persist.read( args.persist )
+		username = config.get( 'auth', 'username' )
+		running_tasks = persist.get( 'tasks', 'running' ).split( ',' )
+		last_closed_task_epoch = persist.get( 'tasks', 'last_epoch' )
+		last_closed_task_id = persist.get( 'tasks', 'last_id' )
+	else:
+		persist.add_section( 'tasks' )
 
 	for e in events:
-		logger.info( '[{}] {}'.format( e.createdTime, e.fullFormattedMessage ) )
+
+		task_id = e.key.split( '-' )[1]
+		task_epoch = calendar.timegm( e.startTime.timetuple() )
+		
+		if task_id in running_tasks and 'running' == e.state:
+			# Come back to this next run. No news is good news.
+			continue
+		elif task_id in running_tasks and 'running' != e.state:
+			# The task has completed.
+			running_tasks.remove( task_id )
+		elif task_id not in running_tasks and 'running' == e.state:
+			# This must be a new running task.
+			running_tasks.add( task_id )
+		
+		if task_epoch < last_closed_task_epoch or task_id == last_closed_task_id:
+			# This task was already closed and reported.
+			continue
+		elif task_epoch > last_closed_task_epoch:
+			last_closed_task = task_sort_key
+
+		# Output the current task.
+		if 'json' == args.output:
+			print( jsonpickle.encode( e ) )
+		elif 'log' == args.output:
+			if vim.TaskReasonSchedule == type( e.reason ):
+				reason = 'schedule'
+			elif vim.TaskReasonUser == type( e.reason ):
+				reason = e.reason.userName
+			logger.info( '[{}]: {}: {}: {} by {}'.format(
+				e.completeTime,
+				e.entityName,
+				e.state,
+				e.descriptionId,
+				reason ) )
+
+	persist.set( 'tasks', 'running', ','.join( running_tasks ) )
+	persist.set( 'tasks', 'last', last_closed_task )
+	with open( args.persist, 'w' ) as persist_file:
+		persist.write( persist_file )
 
 if '__main__' == __name__:
 	main()

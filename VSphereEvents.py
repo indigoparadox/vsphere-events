@@ -11,11 +11,13 @@ import argparse
 import jsonpickle
 import os
 import calendar
+import syslog
+from logging.handlers import SysLogHandler
 
 FILTER_TASKS=1
 FILTER_EVENTS=2
 
-def request_filter( hours=24, no_verify=True, f_type=FILTER_TASKS ):
+def request_filter( hours, no_verify, f_type=FILTER_TASKS, duration=None ):
 
 	logger = logging.getLogger( 'request.filter' )
 
@@ -35,7 +37,10 @@ def request_filter( hours=24, no_verify=True, f_type=FILTER_TASKS ):
 	now = datetime.now()
 	time_filter.timeType = vim.TaskFilterSpec.TimeOption.startedTime
 	time_filter.beginTime = now - timedelta( hours=hours )
-	time_filter.endTime = now
+	if duration:
+		time_filter.endTime = time_filter.beginTime + timedelta( hours=duration )
+	else:
+		time_filter.endTime = now
 	if FILTER_TASKS == f_type:
 		filter_spec = vim.TaskFilterSpec( time=time_filter )
 	elif FILTER_EVENTS == f_type:
@@ -111,6 +116,9 @@ def main():
 		'-r', '--hours', action='store', type=int, default=24,
 		help='Number of hours back to retrieve.' )
 	parser.add_argument(
+		'-u', '--duration', action='store', type=int, default=None,
+		help='Number of hours to retrieve from HOURS.' )
+	parser.add_argument(
 		'-c', '--config', action='store', type=str,
 		default='Local/vsphere.ini',
 		help='Path to config file.' )
@@ -137,13 +145,19 @@ def main():
 	logging.basicConfig( level=loglevel )
 	logger = logging.getLogger( 'main' )
 
+	if 'syslog' == args.output:
+		print( 'Logging to syslog...' )
+		handler = SysLogHandler( address='/dev/log' )
+		logger.addHandler( handler )
+
 	config = ConfigParser()
 	config.read( args.config )
 	username = config.get( 'auth', 'username' )
 	password = config.get( 'auth', 'password' )
 	hostname = config.get( 'auth', 'hostname' )
 
-	filter_spec = request_filter( hours=args.hours, no_verify=args.noverify )
+	filter_spec = request_filter(
+		hours=args.hours, no_verify=args.noverify, duration=args.duration )
 	tasks = request_tasks(
 		filter_spec, username, password, hostname, args.persist )
 	tasks.sort( key=lambda x: calendar.timegm( x.startTime.timetuple() ) )
@@ -208,13 +222,14 @@ def main():
 		# Output the current task.
 		if 'json' == args.output:
 			print( jsonpickle.encode( e ) )
-		elif 'log' == args.output:
+		elif 'log' == args.output or 'syslog' == args.output:
 			if vim.TaskReasonSchedule == type( e.reason ):
 				reason = 'schedule'
 			elif vim.TaskReasonUser == type( e.reason ):
 				reason = e.reason.userName
-			logger.info( '[{}]: {}: {}: {} by {}'.format(
-				e.completeTime,
+			start_time = str( e.startTime ).split( '+' )[0]
+			logger.info( 'vcsatask VCSATask started {}: {}: {}: {} by {}'.format(
+				start_time,
 				e.entityName,
 				e.state,
 				e.descriptionId,

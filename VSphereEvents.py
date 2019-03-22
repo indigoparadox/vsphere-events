@@ -13,6 +13,7 @@ import os
 import calendar
 import syslog
 from logging.handlers import SysLogHandler
+import mysql.connector as mysql
 
 FILTER_TASKS=1
 FILTER_EVENTS=2
@@ -236,11 +237,16 @@ def main():
 	parser.add_argument(
 		'-v', '--verbose', action='store_true',
 		help='Debug output.' )
+	parser.add_argument(
+		'-q', '--quiet', action='store_true',
+		help='Silent output to console.' )
 
 	args = parser.parse_args()
 
 	if args.verbose:
 		loglevel = logging.DEBUG
+	elif args.quiet:
+		loglevel = logging.WARNING
 	else:
 		loglevel = logging.INFO
 	logging.basicConfig( level=loglevel )
@@ -269,20 +275,37 @@ def main():
 	#running_tasks=[]
 	persist = Persist( args.persist )
 
+	if 'mysql' == args.output:
+		db = mysql.connect(
+			host = config.get( 'mysql', 'hostname' ),
+			user = config.get( 'mysql', 'username' ),
+			passwd = config.get( 'mysql', 'password' ),
+			database = config.get( 'mysql', 'database' )
+		)
+		cursor = db.cursor()
+		query = 'CREATE TABLE IF NOT EXISTS tasks (' + \
+				'`task_id` INT NOT NULL, `desc` VARCHAR(255), start DATETIME, ' + \
+				'complete DATETIME, reason VARCHAR(255), state VARCHAR(64), ' + \
+				'entity VARCHAR(64), ' + \
+				'PRIMARY KEY(task_id))'
+		cursor.execute( query )
+
 	def proc_task( e ):
+
+		start_time = str( e.startTime ).split( '+' )[0]
+		end_time = str( e.completeTime ).split( '+' )[0]
+		task_id = int( str( e.task ).split( '-' )[1][:-1] )
+
 		# Output the current task.
 		if 'json' == args.output:
 			print( jsonpickle.encode( e ) )
-		elif 'mysql' == args.output:
-			pass
-		elif 'log' == args.output or 'syslog' == args.output:
+		elif 'log' == args.output or \
+		'syslog' == args.output or \
+		'mysql' == args.output:
 			if vim.TaskReasonSchedule == type( e.reason ):
 				reason = 'schedule'
 			elif vim.TaskReasonUser == type( e.reason ):
 				reason = e.reason.userName
-			start_time = str( e.startTime ).split( '+' )[0]
-			end_time = str( e.completeTime ).split( '+' )[0]
-			task_id = int( str( e.task ).split( '-' )[1][:-1] )
 			logger.info(
 				'vcsatask VCSATask {} started {} completed {}: {}: {}: {} by {}'
 			.format(
@@ -294,8 +317,27 @@ def main():
 				e.descriptionId,
 				reason ) )
 
+		if 'mysql' == args.output:
+			cursor.execute( 'SELECT * FROM tasks WHERE `task_id`={};'.format(
+				task_id ) )
+			records = cursor.fetchall()
+			if 0 == len( records ):
+				logger.debug( 'Adding to database...' )
+				query = "INSERT INTO tasks (`task_id`, `desc`, start, " + \
+					"complete, reason, state, entity) VALUES " + \
+					"('{}', '{}', '{}', '{}', '{}', '{}', '{}');".format(
+						task_id, e.descriptionId,
+						e.startTime,
+						e.completeTime,
+						reason,
+						e.state, e.entityName )
+				cursor.execute( query )
+
 	iterate_tasks( persist, tasks, proc_task )
 
+	if 'mysql' == args.output:
+		db.commit()
+	
 if '__main__' == __name__:
 	main()
 

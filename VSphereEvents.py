@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta
 from pyVim.connect import SmartConnect
 from pyVmomi import vim, vmodl
-from ConfigParser import RawConfigParser as ConfigParser
+from ConfigParser import ConfigParser, NoSectionError
 import requests
 import ssl
 import logging
@@ -108,6 +108,62 @@ def request_tasks( filter_spec, username, password, hostname, persist ):
 
 	return tasks
 
+class Persist():
+	def __init__( self, persist_path ):
+		self._logger = logging.getLogger( 'open.persist' )
+		self._persist_path = persist_path
+		self._persist = ConfigParser()
+		if os.path.exists( persist_path ):
+			try:
+				self._persist.read( persist_path )
+				test = self._persist.get( 'tasks', 'current' )
+			except NoSectionError as e:
+				self._logger.error( 'Tasks section not found; creating...' )
+				self._persist.add_section( 'tasks' )
+				self._persist.set( 'tasks', 'running', '' )
+				self._persist.set( 'tasks', 'current', '' )
+				self._persist.set( 'tasks', 'current_tasks', '' )
+		else:
+			self._persist.add_section( 'tasks' )
+			self._persist.set( 'tasks', 'running', '' )
+			self._persist.set( 'tasks', 'current', '' )
+			self._persist.set( 'tasks', 'current_tasks', '' )
+
+	def get_running_tasks( self ):
+		return self._persist.get( 'tasks', 'running' ).split( ',' )
+
+	def get_last_pass_epoch( self ):
+		try:
+			return int( self._persist.get( 'tasks', 'current' ) )
+		except ValueError as e:
+			return 0
+
+	def get_last_pass_epoch_tasks( self ):
+		return self._persist.get( 'tasks', 'current_tasks' ).split( ',' )
+
+	def remove_running_task( self, task_id ):
+		running_tasks = self._persist.get( 'tasks', 'running' ).split( ',' )
+		running_tasks.remove( task_id )
+		self._persist.set( 'tasks', 'running', ','.join( running_tasks ) )
+
+	def add_running_task( self, task_id ):
+		running_tasks = self._persist.get( 'tasks', 'running' ).split( ',' )
+		running_tasks.append( task_id )
+		self._persist.set( 'tasks', 'running', ','.join( running_tasks ) )
+
+	def add_current_task( self, task_id ):
+		tasks = self._persist.get( 'tasks', 'current_tasks' ).split( ',' )
+		tasks.append( task_id )
+		self._persist.set( 'tasks', 'current_tasks', ','.join( tasks ) )
+
+	def reset_epoch( self, new_epoch ):
+		self._persist.set( 'tasks', 'current', str( new_epoch ) )
+		self._persist.set( 'tasks', 'current_tasks', '' )
+
+	def save( self ):
+		with open( self._persist_path, 'w' ) as persist_file:
+			self._persist.write( persist_file )
+
 def main():
 
 	parser = argparse.ArgumentParser()
@@ -163,41 +219,33 @@ def main():
 	tasks.sort( key=lambda x: calendar.timegm( x.startTime.timetuple() ) )
 
 	# Grab the current persist state if any.
-	last_pass_epoch=0
-	last_pass_epoch_tasks=[]
-	running_tasks=[]
-	persist = ConfigParser()
-	if os.path.exists( args.persist ):
-		persist.read( args.persist )
-		last_pass_epoch = persist.get( 'tasks', 'current' )
-		last_pass_epoch_tasks = \
-			persist.get( 'tasks', 'current_tasks' ).split( ',' )
-		running_tasks = persist.get( 'tasks', 'running' ).split( ',' )
-	else:
-		persist.add_section( 'tasks' )
+	#last_pass_epoch=0
+	#last_pass_epoch_tasks=[]
+	#running_tasks=[]
+	persist = Persist( args.persist )
 
 	for e in tasks:
 
 		task_id = e.key.split( '-' )[1]
 		task_epoch = calendar.timegm( e.startTime.timetuple() )
 		
-		if task_id in running_tasks and 'running' == e.state:
+		if task_id in persist.get_running_tasks() and 'running' == e.state:
 			# Come back to this next run. No news is good news.
 			continue
-		elif task_id in running_tasks and 'running' != e.state:
+		elif task_id in persist.get_running_tasks() and 'running' != e.state:
 			# The task has completed.
-			running_tasks.remove( task_id )
-		elif task_id not in running_tasks and 'running' == e.state:
+			persist.remove_running_task( task_id )
+		elif task_id not in persist.get_running_tasks() and 'running' == e.state:
 			# This must be a new running task.
-			running_tasks.append( task_id )
+			persist.add_running_task( task_id )
 		
-		if int( task_epoch ) < int( last_pass_epoch ):
+		if int( task_epoch ) < persist.get_last_pass_epoch():
 			# Ancient history.
 			logger.debug( 'Old task {} in epoch: {} (LPE: {})'.format(
-				task_id, task_epoch, last_pass_epoch ) )
+				task_id, task_epoch, persist.get_last_pass_epoch() ) )
 			continue
-		elif int( task_epoch ) == int( last_pass_epoch ):
-			if task_id in last_pass_epoch_tasks:
+		elif int( task_epoch ) == persist.get_last_pass_epoch():
+			if task_id in persist.get_last_pass_epoch_tasks():
 				# This task was already closed and reported.
 				logger.debug( 'Skipping task {} in epoch: {}'.format(
 					task_id, task_epoch ) )
@@ -206,18 +254,12 @@ def main():
 				# A new task for this epoch.
 				logger.debug( 'Adding task {} to epoch: {}'.format(
 					task_id, task_epoch ) )
-				last_pass_epoch_tasks.append( task_id )
-				persist.set( 'tasks', 'current_tasks', 
-					','.join( last_pass_epoch_tasks )  )
+				persist.add_current_task( task_id )
 		else:
 			# Task with a new epoch, so the previous is probably closed.
 			logger.debug( 'Opening new epoch: {}'.format( task_epoch ) )
-			last_pass_epoch = task_epoch
-			last_pass_epoch_tasks = []
-			last_pass_epoch_tasks.append( task_id )
-			persist.set( 'tasks', 'current', last_pass_epoch )
-			persist.set( 'tasks', 'current_tasks',
-				','.join( last_pass_epoch_tasks )  )
+			persist.reset_epoch( task_epoch )
+			persist.add_current_task( task_id )
 
 		# Output the current task.
 		if 'json' == args.output:
@@ -228,16 +270,20 @@ def main():
 			elif vim.TaskReasonUser == type( e.reason ):
 				reason = e.reason.userName
 			start_time = str( e.startTime ).split( '+' )[0]
-			logger.info( 'vcsatask VCSATask started {}: {}: {}: {} by {}'.format(
+			end_time = str( e.completeTime ).split( '+' )[0]
+			task_id = int( str( e.task ).split( '-' )[1][:-1] )
+			logger.info(
+				'vcsatask VCSATask {} started {} completed {}: {}: {}: {} by {}'
+			.format(
+				task_id,
 				start_time,
+				end_time,
 				e.entityName,
 				e.state,
 				e.descriptionId,
 				reason ) )
 
-	persist.set( 'tasks', 'running', ','.join( running_tasks ) )
-	with open( args.persist, 'w' ) as persist_file:
-		persist.write( persist_file )
+	persist.save()
 
 if '__main__' == __name__:
 	main()

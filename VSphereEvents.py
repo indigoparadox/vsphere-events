@@ -164,6 +164,51 @@ class Persist():
 		with open( self._persist_path, 'w' ) as persist_file:
 			self._persist.write( persist_file )
 
+def iterate_tasks( persist, tasks, proc_task ):
+
+	logger = logging.getLogger( 'iterate.tasks' )
+
+	for e in tasks:
+		task_id = e.key.split( '-' )[1]
+		task_epoch = calendar.timegm( e.startTime.timetuple() )
+		
+		if task_id in persist.get_running_tasks() and 'running' == e.state:
+			# Come back to this next run. No news is good news.
+			continue
+		elif task_id in persist.get_running_tasks() and 'running' != e.state:
+			# The task has completed.
+			persist.remove_running_task( task_id )
+		elif task_id not in persist.get_running_tasks() and 'running' == e.state:
+			# This must be a new running task.
+			persist.add_running_task( task_id )
+		
+		if int( task_epoch ) < persist.get_last_pass_epoch():
+			# Ancient history.
+			logger.debug( 'Old task {} in epoch: {} (LPE: {})'.format(
+				task_id, task_epoch, persist.get_last_pass_epoch() ) )
+			continue
+		elif int( task_epoch ) == persist.get_last_pass_epoch():
+			if task_id in persist.get_last_pass_epoch_tasks():
+				# This task was already closed and reported.
+				logger.debug( 'Skipping task {} in epoch: {}'.format(
+					task_id, task_epoch ) )
+				continue
+			else:
+				# A new task for this epoch.
+				logger.debug( 'Adding task {} to epoch: {}'.format(
+					task_id, task_epoch ) )
+				persist.add_current_task( task_id )
+		else:
+			# Task with a new epoch, so the previous is probably closed.
+			logger.debug( 'Opening new epoch: {}'.format( task_epoch ) )
+			persist.reset_epoch( task_epoch )
+			persist.add_current_task( task_id )
+
+		proc_task( e )
+
+	persist.save()
+
+
 def main():
 
 	parser = argparse.ArgumentParser()
@@ -224,46 +269,12 @@ def main():
 	#running_tasks=[]
 	persist = Persist( args.persist )
 
-	for e in tasks:
-
-		task_id = e.key.split( '-' )[1]
-		task_epoch = calendar.timegm( e.startTime.timetuple() )
-		
-		if task_id in persist.get_running_tasks() and 'running' == e.state:
-			# Come back to this next run. No news is good news.
-			continue
-		elif task_id in persist.get_running_tasks() and 'running' != e.state:
-			# The task has completed.
-			persist.remove_running_task( task_id )
-		elif task_id not in persist.get_running_tasks() and 'running' == e.state:
-			# This must be a new running task.
-			persist.add_running_task( task_id )
-		
-		if int( task_epoch ) < persist.get_last_pass_epoch():
-			# Ancient history.
-			logger.debug( 'Old task {} in epoch: {} (LPE: {})'.format(
-				task_id, task_epoch, persist.get_last_pass_epoch() ) )
-			continue
-		elif int( task_epoch ) == persist.get_last_pass_epoch():
-			if task_id in persist.get_last_pass_epoch_tasks():
-				# This task was already closed and reported.
-				logger.debug( 'Skipping task {} in epoch: {}'.format(
-					task_id, task_epoch ) )
-				continue
-			else:
-				# A new task for this epoch.
-				logger.debug( 'Adding task {} to epoch: {}'.format(
-					task_id, task_epoch ) )
-				persist.add_current_task( task_id )
-		else:
-			# Task with a new epoch, so the previous is probably closed.
-			logger.debug( 'Opening new epoch: {}'.format( task_epoch ) )
-			persist.reset_epoch( task_epoch )
-			persist.add_current_task( task_id )
-
+	def proc_task( e ):
 		# Output the current task.
 		if 'json' == args.output:
 			print( jsonpickle.encode( e ) )
+		elif 'mysql' == args.output:
+			pass
 		elif 'log' == args.output or 'syslog' == args.output:
 			if vim.TaskReasonSchedule == type( e.reason ):
 				reason = 'schedule'
@@ -283,7 +294,7 @@ def main():
 				e.descriptionId,
 				reason ) )
 
-	persist.save()
+	iterate_tasks( persist, tasks, proc_task )
 
 if '__main__' == __name__:
 	main()

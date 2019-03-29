@@ -306,6 +306,10 @@ def main():
 				reason = 'schedule'
 			elif vim.TaskReasonUser == type( e.reason ):
 				reason = e.reason.userName
+			else:
+				print( 'Unknown reason: {}'.format( e.reason ) )
+				return
+
 			logger.info(
 				'vcsatask VCSATask {} started {} completed {}: {}: {}: {} by {}'
 			.format(
